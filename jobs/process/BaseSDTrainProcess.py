@@ -1449,8 +1449,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 with self.timer('predict_noise'):
                     noise_pred = self.sd.predict_noise(
                         noisy_latents,
-                        timesteps,
                         text_embeddings,
+                        timesteps,
                         guidance_scale=1.0
                     )
 
