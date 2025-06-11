@@ -264,7 +264,14 @@ class Flex2(BaseModel):
     ):
         with torch.no_grad():
             bs, c, h, w = latent_model_input.shape
-            patch_size = getattr(self.unet_unwrapped.config, "patch_size", 2)
+            patch_size = getattr(self.unet_unwrapped.config, "patch_size", None)
+            if patch_size is None or patch_size <= 1:
+                in_channels = getattr(self.unet_unwrapped.config, "in_channels", None)
+                latent_ch = self.vae.config.latent_channels
+                if in_channels is not None:
+                    patch_size = int((in_channels / latent_ch) ** 0.5)
+                else:
+                    patch_size = 2
             latent_model_input_packed = rearrange(
                 latent_model_input,
                 "b c (h ph) (w pw) -> b (h w) (c ph pw)",
