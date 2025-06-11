@@ -1447,12 +1447,21 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     text_embeddings = PromptEmbeds(text_embeddings)
 
                 with self.timer('predict_noise'):
-                    noise_pred = self.sd.predict_noise(
-                        noisy_latents,
-                        text_embeddings,
-                        timesteps,
-                        guidance_scale=1.0
-                    )
+                    try:
+                        noise_pred = self.sd.predict_noise(
+                            noisy_latents,
+                            text_embeddings,
+                            timesteps,
+                            guidance_scale=1.0
+                        )
+                    except RuntimeError as e:
+                        print(
+                            f"[Stable Eval] predict_noise failed: {e}\n"
+                            f"\tnoisy_latents: {tuple(noisy_latents.shape)}\n"
+                            f"\ttimesteps: {tuple(timesteps.shape)}\n"
+                            f"\ttext_embeds: {tuple(text_embeddings.text_embeds.shape)}"
+                        )
+                        raise
 
                 loss = torch.nn.functional.mse_loss(noise_pred, noise, reduction="mean")
 
