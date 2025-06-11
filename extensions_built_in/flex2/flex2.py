@@ -100,9 +100,10 @@ class Flex2(BaseModel):
             in_channels = getattr(self.unet_unwrapped.config, "in_channels", None)
             latent_ch = self.vae.config.latent_channels
             if in_channels is not None:
-                patch_size = int((in_channels / latent_ch) ** 0.5)
+                patch_size = round((in_channels / latent_ch) ** 0.5)
             else:
                 patch_size = 1
+        patch_size = max(patch_size, 1)
 
         return base_div * patch_size
 
@@ -287,9 +288,10 @@ class Flex2(BaseModel):
                 in_channels = getattr(self.unet_unwrapped.config, "in_channels", None)
                 latent_ch = self.vae.config.latent_channels
                 if in_channels is not None:
-                    patch_size = int((in_channels / latent_ch) ** 0.5)
+                    patch_size = round((in_channels / latent_ch) ** 0.5)
                 else:
                     patch_size = 2
+            patch_size = max(patch_size, 1)
             latent_model_input_packed = rearrange(
                 latent_model_input,
                 "b c (h ph) (w pw) -> b (h w) (c ph pw)",
