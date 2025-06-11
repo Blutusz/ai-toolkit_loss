@@ -86,7 +86,25 @@ class Flex2(BaseModel):
         return CustomFlowMatchEulerDiscreteScheduler(**scheduler_config)
 
     def get_bucket_divisibility(self):
-        return 16
+        # Flex2 packs latents into patches before feeding them to the transformer.
+        # The patch size is defined by the UNet configuration.  In order for the
+        # patching operation to succeed, the spatial dimensions of the latents
+        # (and thus the training images) must be divisible by this patch size
+        # multiplied by the VAE downsampling factor.
+
+        # base divisibility is determined from the VAE configuration
+        base_div = super().get_bucket_divisibility()
+
+        patch_size = getattr(self.unet_unwrapped.config, "patch_size", None)
+        if patch_size is None or patch_size <= 1:
+            in_channels = getattr(self.unet_unwrapped.config, "in_channels", None)
+            latent_ch = self.vae.config.latent_channels
+            if in_channels is not None:
+                patch_size = int((in_channels / latent_ch) ** 0.5)
+            else:
+                patch_size = 1
+
+        return base_div * patch_size
 
     def load_model(self):
         dtype = self.torch_dtype
