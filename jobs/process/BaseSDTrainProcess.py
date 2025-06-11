@@ -69,6 +69,7 @@ from accelerate import Accelerator
 import transformers
 import diffusers
 import hashlib
+from toolkit.prompt_utils import PromptEmbeds
 
 from toolkit.util.blended_blur_noise import get_blended_blur_noise
 from toolkit.util.get_model import get_model_class
@@ -1441,6 +1442,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         )
                     else:
                         text_embeddings = self.sd.encode_prompt(conditioned_prompts)
+
+                if not hasattr(text_embeddings, 'text_embeds'):
+                    text_embeddings = PromptEmbeds(text_embeddings)
 
                 with self.timer('predict_noise'):
                     noise_pred = self.sd.predict_noise(
