@@ -37,6 +37,16 @@ config:
           shuffle_tokens: false  # shuffle caption order, split by commas
           cache_latents_to_disk: true  # leave this true unless you know what you're doing
           resolution: [ 512, 768, 1024 ]  # flux enjoys multiple resolutions
+      validation_datasets:
+        - folder_path: "data/val"
+          caption_ext: "txt"
+          cache_latents_to_disk: true
+          resolution: [512, 768, 1024]
+      stable_eval:
+        enabled: true
+        every_n_steps: 500
+        seed: 42
+        max_batches: 10
       train:
         batch_size: 1
         steps: 2000  # total number of steps to train 500 - 4000 is a good range
