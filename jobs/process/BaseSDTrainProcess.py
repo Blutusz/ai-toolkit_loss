@@ -4,6 +4,7 @@ import inspect
 import json
 import random
 import shutil
+from pathlib import Path
 from collections import OrderedDict
 import os
 import re
@@ -234,7 +235,23 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.named_lora = True
         self.snr_gos: Union[LearnableSNRGamma, None] = None
         self.ema: ExponentialMovingAverage = None
-        
+
+        # Stable evaluation configuration
+        self.stable_eval_config = self.get_conf('stable_eval', {})
+        self.stable_eval_enabled = self.stable_eval_config.get('enabled', False)
+        self.stable_eval_every = self.stable_eval_config.get('every_n_steps', 500)
+        self.stable_eval_seed = self.stable_eval_config.get('seed', 42)
+        self.stable_eval_max_batches = self.stable_eval_config.get('max_batches', 10)
+
+        # Tracking
+        self.val_loss_history = []
+        self.train_loss_history = []
+        self.stable_eval_step_count = 0
+        self.val_dataloader = None
+
+        if self.stable_eval_enabled:
+            print(f"[Stable Eval] Enabled with config: {self.stable_eval_config}")
+
         validate_configs(self.train_config, self.model_config, self.save_config)
 
     def post_process_generate_image_config_list(self, generate_image_config_list: List[GenerateImageConfig]):
@@ -737,8 +754,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
         return None
 
     def hook_train_loop(self, batch):
-        # return loss
-        return 0.0
+        # Get the original loss from subclass implementation
+        loss_dict = 0.0  # This will be overridden by subclass
+
+        # Track for stable eval if enabled
+        if hasattr(self, 'stable_eval_enabled') and self.stable_eval_enabled:
+            self.stable_eval_step_count = self.step_num
+
+        return loss_dict
     
     def hook_after_sd_init_before_load(self):
         pass
@@ -1333,6 +1356,160 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         return noisy_latents, noise, timesteps, conditioned_prompts, imgs
 
+    def load_validation_dataset(self):
+        """Load validation dataset for stable evaluation"""
+        if not self.stable_eval_enabled:
+            return
+
+        val_datasets_config = self.get_conf('validation_datasets', [])
+        if not val_datasets_config:
+            print("[Stable Eval] No validation datasets configured")
+            return
+
+        print("[Stable Eval] Loading validation dataset...")
+
+        val_datasets = []
+        for raw_dataset in val_datasets_config:
+            dataset = DatasetConfig(**raw_dataset)
+            dataset.shuffle = False
+            val_datasets.append(dataset)
+
+        from toolkit.data_loader import get_dataloader_from_datasets
+        self.val_dataloader = get_dataloader_from_datasets(
+            val_datasets,
+            self.train_config.batch_size,
+            self.sd
+        )
+
+        print(f"[Stable Eval] Loaded {len(self.val_dataloader)} validation batches")
+
+    def compute_stable_validation_loss(self):
+        """Compute deterministic validation loss"""
+        if not self.stable_eval_enabled or self.val_dataloader is None:
+            return None
+
+        print(f"[Stable Eval] Computing validation loss at step {self.stable_eval_step_count}...")
+
+        import torch
+        import numpy as np
+        import random
+
+        rng_states = {
+            'torch': torch.get_rng_state(),
+            'cuda': torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+            'numpy': np.random.get_state(),
+            'python': random.getstate()
+        }
+
+        torch.manual_seed(self.stable_eval_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(self.stable_eval_seed)
+        np.random.seed(self.stable_eval_seed)
+        random.seed(self.stable_eval_seed)
+
+        self.sd.unet.eval()
+        if hasattr(self.sd, 'vae'):
+            self.sd.vae.eval()
+        if hasattr(self.sd, 'text_encoder') and self.sd.text_encoder is not None:
+            if isinstance(self.sd.text_encoder, list):
+                for te in self.sd.text_encoder:
+                    te.eval()
+            else:
+                self.sd.text_encoder.eval()
+
+        total_loss = 0.0
+        num_batches = 0
+
+        with torch.no_grad():
+            val_iter = iter(self.val_dataloader)
+            for batch_idx in range(min(self.stable_eval_max_batches, len(self.val_dataloader))):
+                try:
+                    batch = next(val_iter)
+                except StopIteration:
+                    break
+
+                noisy_latents, noise, timesteps, conditioned_prompts, imgs = self.process_general_training_batch(batch)
+
+                with self.timer('encode_prompt'):
+                    text_embeddings = self.sd.encode_prompts(
+                        prompts=conditioned_prompts,
+                        tokenizer=self.sd.tokenizer,
+                        text_encoder=self.sd.text_encoder,
+                        is_training=True,
+                        train_encoder=False
+                    )
+
+                with self.timer('predict_noise'):
+                    noise_pred = self.sd.predict_noise(
+                        noisy_latents,
+                        timesteps,
+                        text_embeddings,
+                        guidance_scale=1.0
+                    )
+
+                loss = torch.nn.functional.mse_loss(noise_pred, noise, reduction="mean")
+
+                total_loss += loss.item()
+                num_batches += 1
+
+        self.sd.unet.train()
+        if hasattr(self.sd, 'vae'):
+            self.sd.vae.train()
+        if hasattr(self.sd, 'text_encoder') and self.sd.text_encoder is not None:
+            if isinstance(self.sd.text_encoder, list):
+                for te in self.sd.text_encoder:
+                    te.train()
+            else:
+                self.sd.text_encoder.train()
+
+        torch.set_rng_state(rng_states['torch'])
+        if rng_states['cuda'] is not None:
+            torch.cuda.set_rng_state(rng_states['cuda'])
+        np.random.set_state(rng_states['numpy'])
+        random.setstate(rng_states['python'])
+
+        avg_val_loss = total_loss / num_batches if num_batches > 0 else 0
+        print(f"[Stable Eval] Validation loss: {avg_val_loss:.6f}")
+
+        return avg_val_loss
+
+    def save_stable_eval_history(self):
+        """Save loss history to JSON file"""
+        if not self.stable_eval_enabled:
+            return
+
+        output_dir = Path(self.save_root)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        history_data = {
+            'train_loss': self.train_loss_history[-1000:],
+            'val_loss': self.val_loss_history,
+            'config': self.stable_eval_config
+        }
+
+        with open(output_dir / 'stable_eval_history.json', 'w') as f:
+            json.dump(history_data, f, indent=2)
+
+        try:
+            import matplotlib.pyplot as plt
+
+            if len(self.val_loss_history) > 1:
+                val_steps = [h['step'] for h in self.val_loss_history]
+                val_losses = [h['loss'] for h in self.val_loss_history]
+
+                plt.figure(figsize=(10, 6))
+                plt.plot(val_steps, val_losses, 'ro-', label='Validation Loss (Stable)', markersize=6)
+                plt.xlabel('Step')
+                plt.ylabel('Loss')
+                plt.title('Stable Validation Loss')
+                plt.grid(True, alpha=0.3)
+                plt.legend()
+                plt.tight_layout()
+                plt.savefig(output_dir / 'stable_eval_loss.png', dpi=150)
+                plt.close()
+        except Exception:
+            pass
+
     def setup_adapter(self):
         # t2i adapter
         is_t2i = self.adapter_config.type == 't2i'
@@ -1901,6 +2078,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.datasets_reg is not None:
             self.data_loader_reg = get_dataloader_from_datasets(self.datasets_reg, self.train_config.batch_size,
                                                                 self.sd)
+        # Load validation dataset for stable eval
+        if self.stable_eval_enabled:
+            self.load_validation_dataset()
 
         flush()
         self.last_save_step = self.step_num
@@ -2165,6 +2345,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                 self.logger.log({
                                     f'loss/{key}': value,
                                 })
+
                     elif self.logging_config.log_every is None:
                         if self.accelerator.is_main_process:
                             # log every step
@@ -2175,6 +2356,33 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                 self.logger.log({
                                     f'loss/{key}': value,
                                 })
+
+                    # Add stable evaluation tracking
+                    if self.stable_eval_enabled and 'loss' in loss_dict:
+                        self.train_loss_history.append({
+                            'step': self.step_num,
+                            'loss': loss_dict['loss']
+                        })
+
+                        if self.step_num % self.stable_eval_every == 0:
+                            if self.progress_bar is not None:
+                                self.progress_bar.pause()
+
+                            val_loss = self.compute_stable_validation_loss()
+
+                            if val_loss is not None:
+                                self.val_loss_history.append({
+                                    'step': self.step_num,
+                                    'loss': val_loss
+                                })
+
+                                if self.writer is not None:
+                                    self.writer.add_scalar('loss/validation_stable', val_loss, self.step_num)
+
+                                self.save_stable_eval_history()
+
+                            if self.progress_bar is not None:
+                                self.progress_bar.unpause()
 
 
                     if self.performance_log_every > 0 and self.step_num % self.performance_log_every == 0:
