@@ -1431,13 +1431,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 noisy_latents, noise, timesteps, conditioned_prompts, imgs = self.process_general_training_batch(batch)
 
                 with self.timer('encode_prompt'):
-                    text_embeddings = self.sd.encode_prompts(
-                        prompts=conditioned_prompts,
-                        tokenizer=self.sd.tokenizer,
-                        text_encoder=self.sd.text_encoder,
-                        is_training=True,
-                        train_encoder=False
-                    )
+                    if hasattr(self.sd, 'encode_prompts'):
+                        text_embeddings = self.sd.encode_prompts(
+                            prompts=conditioned_prompts,
+                            tokenizer=self.sd.tokenizer,
+                            text_encoder=self.sd.text_encoder,
+                            is_training=True,
+                            train_encoder=False
+                        )
+                    else:
+                        text_embeddings = self.sd.encode_prompt(conditioned_prompts)
 
                 with self.timer('predict_noise'):
                     noise_pred = self.sd.predict_noise(
